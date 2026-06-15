@@ -22,7 +22,6 @@ export function useBluetoothScanner() {
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState(null)
   const [supported, setSupported] = useState(false)
-  const gattRefs = useRef({})
   const intervalRefs = useRef({})
 
   useEffect(() => {
@@ -44,40 +43,23 @@ export function useBluetoothScanner() {
     ))
   }, [])
 
-  const connectDevice = useCallback(async (device) => {
+  // GATT接続は使わない（ペアリング不要）
+  // watchAdvertisements のみでRSSIを取得する
+  const startAdvertisementWatch = useCallback(async (device) => {
+    if (!device.watchAdvertisements) return false
     try {
-      setDevices(prev => prev.map(d =>
-        d.id === device.id ? { ...d, connecting: true, error: null } : d
-      ))
-
-      const server = await device.gatt.connect()
-      gattRefs.current[device.id] = server
-
-      // Try to read RSSI via a dummy read (triggers connection which gives RSSI on some platforms)
-      // Main RSSI polling via advertisement events workaround
-      setDevices(prev => prev.map(d =>
-        d.id === device.id ? { ...d, connecting: false, connected: true } : d
-      ))
-
-      // Poll every 2s by re-reading a characteristic to keep connection alive
-      // RSSI is updated via advertisement watchAdvertisements where available
-      intervalRefs.current[device.id] = setInterval(() => {
-        if (!device.gatt.connected) {
-          clearInterval(intervalRefs.current[device.id])
-          setDevices(prev => prev.map(d =>
-            d.id === device.id ? { ...d, connected: false, rssi: null } : d
-          ))
-        }
-      }, 2000)
-
-    } catch (err) {
-      setDevices(prev => prev.map(d =>
-        d.id === device.id
-          ? { ...d, connecting: false, error: err.message }
-          : d
-      ))
+      await device.watchAdvertisements()
+      device.addEventListener('advertisementreceived', (event) => {
+        updateDeviceRssi(device.id, event.rssi)
+        setDevices(prev => prev.map(d =>
+          d.id === device.id ? { ...d, connected: true, connecting: false } : d
+        ))
+      })
+      return true
+    } catch (_) {
+      return false
     }
-  }, [])
+  }, [updateDeviceRssi])
 
   const scanForDevice = useCallback(async () => {
     if (!supported) {
@@ -118,36 +100,16 @@ export function useBluetoothScanner() {
 
         setDevices(prev => [...prev, newDevice])
 
-        // Listen for disconnect
-        device.addEventListener('gattserverdisconnected', () => {
-          clearInterval(intervalRefs.current[device.id])
+        // デバイス削除時のクリーンアップのみ（GATT接続なし）
+
+        // watchAdvertisements でRSSI取得（ペアリング不要）
+        const watching = await startAdvertisementWatch(device)
+
+        // watchAdvertisements 非対応の場合はシミュレーション
+        if (!watching) {
           setDevices(prev => prev.map(d =>
-            d.id === device.id
-              ? { ...d, connected: false, rssi: null, distance: null, signalLevel: 'none' }
-              : d
+            d.id === device.id ? { ...d, connected: true, connecting: false } : d
           ))
-        })
-
-        // Try watchAdvertisements for RSSI (Chrome 79+, flagged)
-        if (device.watchAdvertisements) {
-          try {
-            await device.watchAdvertisements()
-            device.addEventListener('advertisementreceived', (event) => {
-              updateDeviceRssi(device.id, event.rssi)
-            })
-          } catch (_) {
-            // Not supported — connect to GATT instead
-          }
-        }
-
-        // Auto-connect
-        await connectDevice(newDevice)
-
-        // Simulate RSSI for demo if no advertisement (GATT connection only gives rough estimate)
-        // We'll start with a reasonable estimate and update when possible
-        if (!device.watchAdvertisements) {
-          // Provide a stable simulated RSSI based on gatt connection quality
-          // Real RSSI requires either watchAdvertisements or platform-specific APIs
           startRssiSimulation(device.id)
         }
       }
@@ -159,7 +121,7 @@ export function useBluetoothScanner() {
     } finally {
       setScanning(false)
     }
-  }, [supported, devices, connectDevice, updateDeviceRssi])
+  }, [supported, devices, startAdvertisementWatch, startRssiSimulation])
 
   // Demo/simulation mode for environments where RSSI isn't accessible
   const startRssiSimulation = useCallback((deviceId) => {
@@ -190,12 +152,11 @@ export function useBluetoothScanner() {
 
   const removeDevice = useCallback((deviceId) => {
     const d = devices.find(x => x.id === deviceId)
-    if (d?.btDevice?.gatt?.connected) {
-      d.btDevice.gatt.disconnect()
+    if (d?.btDevice?.watchAdvertisements) {
+      try { d.btDevice.unwatchAdvertisements?.() } catch (_) {}
     }
     clearInterval(intervalRefs.current[deviceId])
     clearInterval(intervalRefs.current[`sim_${deviceId}`])
-    delete gattRefs.current[deviceId]
     setDevices(prev => prev.filter(x => x.id !== deviceId))
   }, [devices])
 
